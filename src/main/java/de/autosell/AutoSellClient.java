@@ -1,31 +1,39 @@
 package de.autosell;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.GameMenuScreen;
+import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
 import net.minecraft.item.Items;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
-import org.lwjgl.glfw.GLFW;
 
 public class AutoSellClient implements ClientModInitializer {
 
 	private enum State { IDLE, WAIT_MENU, MOVING, CLOSING }
+	private enum Mode { SHIFT, PICKUP }
 
 	private boolean enabled = false;
 	private boolean debug = true;
 	private State state = State.IDLE;
+	private Mode mode = Mode.SHIFT;
+
 	private int timer = 0;
-	private int roundDelay = 40;   // Pause zwischen Runden (Ticks)
-	private int clickDelay = 3;    // Pause zwischen Klicks (Ticks)
+	private int roundDelay = 20;   // Pause zwischen Runden (Ticks)
+	private int perTick = 4;       // Klicks pro Tick
 	private int menuTimeout = 0;
+	private int stuck = 0;
+	private int clicks = 0;
 	private Slot lastSource = null;
+	private boolean savedPauseOnLostFocus = true;
 
 	@Override
 	public void onInitializeClient() {
@@ -48,11 +56,19 @@ public class AutoSellClient implements ClientModInitializer {
 							msg(ctx.getSource().getClient(), "Pause zwischen Runden: " + roundDelay + " Ticks");
 							return 1;
 						})))
-				.then(ClientCommandManager.literal("clickdelay")
-					.then(ClientCommandManager.argument("ticks", IntegerArgumentType.integer(1, 20))
+				.then(ClientCommandManager.literal("speed")
+					.then(ClientCommandManager.argument("klicks", IntegerArgumentType.integer(1, 36))
 						.executes(ctx -> {
-							clickDelay = IntegerArgumentType.getInteger(ctx, "ticks");
-							msg(ctx.getSource().getClient(), "Pause zwischen Klicks: " + clickDelay + " Ticks");
+							perTick = IntegerArgumentType.getInteger(ctx, "klicks");
+							msg(ctx.getSource().getClient(), "Klicks pro Tick: " + perTick);
+							return 1;
+						})))
+				.then(ClientCommandManager.literal("mode")
+					.then(ClientCommandManager.argument("art", StringArgumentType.word())
+						.executes(ctx -> {
+							String a = StringArgumentType.getString(ctx, "art").toLowerCase();
+							mode = a.equals("pickup") ? Mode.PICKUP : Mode.SHIFT;
+							msg(ctx.getSource().getClient(), "Modus: " + mode);
 							return 1;
 						})))));
 
@@ -63,7 +79,15 @@ public class AutoSellClient implements ClientModInitializer {
 		enabled = !enabled;
 		state = State.IDLE;
 		timer = 0;
+		stuck = 0;
 		lastSource = null;
+		if (enabled) {
+			// Kein Pause-Menue bei Fokusverlust -> Makro laeuft auch im Hintergrund
+			savedPauseOnLostFocus = client.options.pauseOnLostFocus;
+			client.options.pauseOnLostFocus = false;
+		} else {
+			client.options.pauseOnLostFocus = savedPauseOnLostFocus;
+		}
 		msg(client, enabled ? "AN" : "AUS");
 	}
 
@@ -90,17 +114,27 @@ public class AutoSellClient implements ClientModInitializer {
 
 		switch (state) {
 			case IDLE -> {
-				if (client.currentScreen instanceof HandledScreen<?> hs) {
-					// Menue ist schon offen: nur loslegen, wenn es nach Sell aussieht
+				Screen cur = client.currentScreen;
+				if (cur instanceof HandledScreen<?> hs) {
 					if (hs.getTitle().getString().toLowerCase().contains("sell")
 							&& hs.getScreenHandler().slots.size() > 36) {
 						dbg(client, "Offenes Sell-Menue erkannt");
-						state = State.MOVING;
-						timer = 3;
+						startMoving();
+					} else {
+						unstick(client);
 					}
 					return;
 				}
-				if (client.currentScreen != null) return;
+				if (cur != null) {
+					if (cur instanceof GameMenuScreen) {
+						client.setScreen(null);
+						dbg(client, "Pause-Menue geschlossen");
+					} else {
+						unstick(client);
+					}
+					return;
+				}
+				stuck = 0;
 				client.getNetworkHandler().sendChatCommand("sell");
 				state = State.WAIT_MENU;
 				menuTimeout = 60;
@@ -111,8 +145,7 @@ public class AutoSellClient implements ClientModInitializer {
 					dbg(client, "Menue erkannt: " + hs.getClass().getSimpleName()
 						+ ", Titel=\"" + hs.getTitle().getString() + "\", Slots="
 						+ hs.getScreenHandler().slots.size());
-					state = State.MOVING;
-					timer = 5;
+					startMoving();
 				} else if (--menuTimeout <= 0) {
 					dbg(client, "Kein Menue nach /sell erschienen, neuer Versuch");
 					state = State.IDLE;
@@ -127,36 +160,14 @@ public class AutoSellClient implements ClientModInitializer {
 					return;
 				}
 				ScreenHandler handler = screen.getScreenHandler();
-
-				if (handler.getCursorStack().isEmpty()) {
-					Slot src = findBerrySlot(handler, client);
-					Slot dst = findTargetSlot(handler, client);
-					if (src == null || dst == null) {
-						dbg(client, src == null
-							? "Fertig: keine Berries mehr im Inventar"
-							: "Fertig: oberes Menue ist voll");
+				for (int i = 0; i < perTick; i++) {
+					if (!step(client, handler)) {
+						dbg(client, "Fertig nach " + clicks + " Klicks");
 						state = State.CLOSING;
-						timer = 5;
+						timer = 3;
 						return;
 					}
-					lastSource = src;
-					moveCursorTo(client, screen, handler, src);
-					click(client, handler, src);
-				} else {
-					Slot dst = findTargetSlot(handler, client);
-					if (dst == null) {
-						if (lastSource != null) {
-							moveCursorTo(client, screen, handler, lastSource);
-							click(client, handler, lastSource);
-						}
-						state = State.CLOSING;
-						timer = 5;
-						return;
-					}
-					moveCursorTo(client, screen, handler, dst);
-					click(client, handler, dst);
 				}
-				timer = clickDelay;
 			}
 			case CLOSING -> {
 				if (client.currentScreen != null) {
@@ -169,12 +180,62 @@ public class AutoSellClient implements ClientModInitializer {
 		}
 	}
 
-	private void click(MinecraftClient client, ScreenHandler handler, Slot slot) {
-		client.interactionManager.clickSlot(
-			handler.syncId, slot.id, 0, SlotActionType.PICKUP, client.player);
+	private void startMoving() {
+		state = State.MOVING;
+		clicks = 0;
+		timer = 3;
 	}
 
-	// Slot im Spielerinventar (die unteren 36 Slots) mit Sweet Berries
+	// Haengt ein fremdes Menue fest? Nach 3 Sekunden schliessen.
+	private void unstick(MinecraftClient client) {
+		if (++stuck > 60) {
+			stuck = 0;
+			if (client.currentScreen instanceof HandledScreen<?>) {
+				client.player.closeHandledScreen();
+			} else {
+				client.setScreen(null);
+			}
+			dbg(client, "Festhaengendes Menue geschlossen");
+		}
+	}
+
+	// Ein Schritt; false = fertig
+	private boolean step(MinecraftClient client, ScreenHandler handler) {
+		if (clicks++ > 200) return false;
+
+		if (mode == Mode.SHIFT) {
+			Slot src = findBerrySlot(handler, client);
+			if (src == null || findTargetSlot(handler, client) == null) return false;
+			clickSlot(client, handler, src, SlotActionType.QUICK_MOVE);
+			return true;
+		}
+
+		// PICKUP: Stack aufnehmen und oben ablegen (ohne Mauszeiger)
+		if (handler.getCursorStack().isEmpty()) {
+			Slot src = findBerrySlot(handler, client);
+			Slot dst = findTargetSlot(handler, client);
+			if (src == null || dst == null) return false;
+			lastSource = src;
+			clickSlot(client, handler, src, SlotActionType.PICKUP);
+			return true;
+		} else {
+			Slot dst = findTargetSlot(handler, client);
+			if (dst == null) {
+				if (lastSource != null) {
+					clickSlot(client, handler, lastSource, SlotActionType.PICKUP);
+				}
+				return false;
+			}
+			clickSlot(client, handler, dst, SlotActionType.PICKUP);
+			return true;
+		}
+	}
+
+	private void clickSlot(MinecraftClient client, ScreenHandler handler, Slot slot, SlotActionType type) {
+		client.interactionManager.clickSlot(handler.syncId, slot.id, 0, type, client.player);
+	}
+
+	// Berry-Slot im Spielerinventar (untere 36 Slots)
 	private Slot findBerrySlot(ScreenHandler handler, MinecraftClient client) {
 		for (Slot slot : handler.slots) {
 			if (slot.inventory == client.player.getInventory()
@@ -196,18 +257,5 @@ public class AutoSellClient implements ClientModInitializer {
 			}
 		}
 		return null;
-	}
-
-	// Setzt den echten Mauszeiger mittig auf den Slot
-	private void moveCursorTo(MinecraftClient client, HandledScreen<?> screen,
-							  ScreenHandler handler, Slot slot) {
-		int rows = (handler.slots.size() - 36) / 9;
-		int bgWidth = 176;
-		int bgHeight = 114 + rows * 18;
-		int left = (screen.width - bgWidth) / 2;
-		int top = (screen.height - bgHeight) / 2;
-		double scale = client.getWindow().getScaleFactor();
-		GLFW.glfwSetCursorPos(client.getWindow().getHandle(),
-			(left + slot.x + 8) * scale, (top + slot.y + 8) * scale);
 	}
 }
