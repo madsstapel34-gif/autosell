@@ -12,15 +12,8 @@ import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
+import org.lwjgl.glfw.GLFW;
 
-/**
- * AutoSell: tippt /sell, packt alle Sweet Berries per Shift-Klick ins Menue,
- * schliesst das Menue (verkauft) und wiederholt das Ganze.
- *
- * Steuerung im Spiel:
- *   /autosell            -> an/aus
- *   /autosell delay <t>  -> Pause zwischen den Runden in Ticks (20 = 1 Sekunde)
- */
 public class AutoSellClient implements ClientModInitializer {
 
 	private enum State { IDLE, WAIT_MENU, MOVING, CLOSING }
@@ -28,9 +21,10 @@ public class AutoSellClient implements ClientModInitializer {
 	private boolean enabled = false;
 	private State state = State.IDLE;
 	private int timer = 0;
-	private int roundDelay = 40;     // Pause zwischen zwei Runden (Ticks)
-	private int clickDelay = 1;      // Ticks zwischen einzelnen Klicks
+	private int roundDelay = 40;   // Pause zwischen Runden (Ticks)
+	private int clickDelay = 3;    // Pause zwischen Klicks (Ticks)
 	private int menuTimeout = 0;
+	private Slot lastSource = null;
 
 	@Override
 	public void onInitializeClient() {
@@ -46,6 +40,13 @@ public class AutoSellClient implements ClientModInitializer {
 							roundDelay = IntegerArgumentType.getInteger(ctx, "ticks");
 							msg(ctx.getSource().getClient(), "Pause zwischen Runden: " + roundDelay + " Ticks");
 							return 1;
+						})))
+				.then(ClientCommandManager.literal("clickdelay")
+					.then(ClientCommandManager.argument("ticks", IntegerArgumentType.integer(1, 20))
+						.executes(ctx -> {
+							clickDelay = IntegerArgumentType.getInteger(ctx, "ticks");
+							msg(ctx.getSource().getClient(), "Pause zwischen Klicks: " + clickDelay + " Ticks");
+							return 1;
 						})))));
 
 		ClientTickEvents.END_CLIENT_TICK.register(this::tick);
@@ -55,6 +56,7 @@ public class AutoSellClient implements ClientModInitializer {
 		enabled = !enabled;
 		state = State.IDLE;
 		timer = 0;
+		lastSource = null;
 		msg(client, enabled ? "AN" : "AUS");
 	}
 
@@ -77,18 +79,16 @@ public class AutoSellClient implements ClientModInitializer {
 
 		switch (state) {
 			case IDLE -> {
-				// Nur /sell senden, wenn kein anderes Menue offen ist
 				if (client.currentScreen != null) return;
 				client.getNetworkHandler().sendChatCommand("sell");
 				state = State.WAIT_MENU;
-				menuTimeout = 60; // 3 Sekunden auf das Menue warten
+				menuTimeout = 60;
 			}
 			case WAIT_MENU -> {
 				if (isSellScreen(client)) {
 					state = State.MOVING;
-					timer = 3; // kurz warten, bis alle Slots synchronisiert sind
+					timer = 5;
 				} else if (--menuTimeout <= 0) {
-					// Menue ging nicht auf -> neu versuchen
 					state = State.IDLE;
 					timer = roundDelay;
 				}
@@ -99,37 +99,87 @@ public class AutoSellClient implements ClientModInitializer {
 					timer = roundDelay;
 					return;
 				}
-				GenericContainerScreenHandler handler =
-					((GenericContainerScreen) client.currentScreen).getScreenHandler();
+				GenericContainerScreen screen = (GenericContainerScreen) client.currentScreen;
+				GenericContainerScreenHandler handler = screen.getScreenHandler();
 
-				Slot berrySlot = null;
-				for (Slot slot : handler.slots) {
-					// nur Slots aus dem Spielerinventar (unterer Teil), nicht aus dem Sell-Menue
-					if (slot.inventory == client.player.getInventory()
-							&& slot.getStack().isOf(Items.SWEET_BERRIES)) {
-						berrySlot = slot;
-						break;
+				if (handler.getCursorStack().isEmpty()) {
+					Slot src = findBerrySlot(handler, client);
+					Slot dst = findTargetSlot(handler, client);
+					if (src == null || dst == null) {
+						state = State.CLOSING;
+						timer = 5;
+						return;
 					}
-				}
-
-				if (berrySlot != null) {
-					client.interactionManager.clickSlot(
-						handler.syncId, berrySlot.id, 0, SlotActionType.QUICK_MOVE, client.player);
-					timer = clickDelay;
+					lastSource = src;
+					moveCursorTo(client, screen, handler, src);
+					click(client, handler, src);
 				} else {
-					state = State.CLOSING;
-					timer = 5;
+					Slot dst = findTargetSlot(handler, client);
+					if (dst == null) {
+						// oben alles voll: Rest zurueck in den Ursprungs-Slot
+						if (lastSource != null) {
+							moveCursorTo(client, screen, handler, lastSource);
+							click(client, handler, lastSource);
+						}
+						state = State.CLOSING;
+						timer = 5;
+						return;
+					}
+					moveCursorTo(client, screen, handler, dst);
+					click(client, handler, dst);
 				}
+				timer = clickDelay;
 			}
 			case CLOSING -> {
-				// Viele /sell-Menues verkaufen beim Schliessen
 				if (client.currentScreen != null) {
-					client.player.closeHandledScreen();
+					client.player.closeHandledScreen(); // Schliessen = Verkaufen
 				}
+				lastSource = null;
 				state = State.IDLE;
 				timer = roundDelay;
 			}
 		}
+	}
+
+	private void click(MinecraftClient client, GenericContainerScreenHandler handler, Slot slot) {
+		client.interactionManager.clickSlot(
+			handler.syncId, slot.id, 0, SlotActionType.PICKUP, client.player);
+	}
+
+	// Slot im Spielerinventar (unten), der Sweet Berries enthaelt
+	private Slot findBerrySlot(GenericContainerScreenHandler handler, MinecraftClient client) {
+		for (Slot slot : handler.slots) {
+			if (slot.inventory == client.player.getInventory()
+					&& slot.getStack().isOf(Items.SWEET_BERRIES)) {
+				return slot;
+			}
+		}
+		return null;
+	}
+
+	// Freier Slot im oberen Sell-Menue (leer oder mit nicht vollem Berry-Stack)
+	private Slot findTargetSlot(GenericContainerScreenHandler handler, MinecraftClient client) {
+		for (Slot slot : handler.slots) {
+			if (slot.inventory == client.player.getInventory()) continue;
+			var stack = slot.getStack();
+			if (stack.isEmpty()
+					|| (stack.isOf(Items.SWEET_BERRIES) && stack.getCount() < stack.getMaxCount())) {
+				return slot;
+			}
+		}
+		return null;
+	}
+
+	// Setzt den echten Mauszeiger mittig auf den Slot
+	private void moveCursorTo(MinecraftClient client, GenericContainerScreen screen,
+							  GenericContainerScreenHandler handler, Slot slot) {
+		int bgWidth = 176;
+		int bgHeight = 114 + handler.getRows() * 18;
+		int left = (screen.width - bgWidth) / 2;
+		int top = (screen.height - bgHeight) / 2;
+		double scale = client.getWindow().getScaleFactor();
+		GLFW.glfwSetCursorPos(client.getWindow().getHandle(),
+			(left + slot.x + 8) * scale, (top + slot.y + 8) * scale);
 	}
 
 	private boolean isSellScreen(MinecraftClient client) {
